@@ -1,0 +1,676 @@
+---
+title: "Airbnb Listing Price Prediction & Neighbourhood Segmentation"
+subtitle: "An Explainable Machine Learning and Unsupervised Segmentation Case Study in R"
+author: "Department of Artificial Intelligence & Data Science, CBIT Hyderabad"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 300
+)
+
+# Ensure Pandoc path is discoverable if knitting in headless / script environments
+if (!rmarkdown::pandoc_available()) {
+  Sys.setenv(RSTUDIO_PANDOC = "C:/Users/Anusha_P/AppData/Local/Pandoc")
+}
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(lime)
+library(cluster)
+library(factoextra)
+library(tibble)
+library(knitr)
+
+# Global random seed for rigorous reproducibility
+set.seed(123)
+```
+
+# Introduction
+
+In short-term accommodation markets such as Airbnb, dynamic and accurate listing price valuation is critical for both property hosts and guests. For hosts, setting a competitive nightly rate dictates booking velocity, listing visibility, and overall revenue; underpricing forfeits margin, while overpricing leads to vacant calendar days and algorithmic deprioritization. For traveling consumers, price transparency ensures fair valuation relative to space, privacy, and geographic accessibility.
+
+This project implements an end-to-end Introduction to Data Science (IDS) case study in **R** using the official 2019 New York City Inside Airbnb snapshot (`AB_NYC_2019.csv`). The study bridges two core paradigms of statistical data science:
+1. **Supervised Regression & Explainable Machine Learning**: Establishing an interpretable baseline using Multiple Linear Regression, comparing it against a non-parametric Random Forest regressor on identical held-out test data, and explaining individual test predictions locally using **LIME** (Local Interpretable Model-agnostic Explanations).
+2. **Unsupervised Market Segmentation**: Applying **K-means clustering** on aggregated neighbourhood-level metrics (pricing, unit supply density, and room capacity mix) to identify empirical market tiers across New York City without arbitrary prior assumptions.
+
+---
+
+# Problem Statement and Objectives
+
+### Problem Statement
+Can an Airbnb listing's nightly price in New York City be reliably predicted from its structural room characteristics, host commercial intensity, and geospatial coordinates? Furthermore, can unsupervised clustering over aggregated neighbourhood statistics uncover distinct geographic market segments that reflect structural socio-economic variations across the metropolitan area?
+
+### Primary Objectives
+1. **Dataset Inspection & Rigorous Preprocessing**: Empirically inspect data types, missingness, and invalid values in `AB_NYC_2019.csv`. Apply the standard Interquartile Range (IQR) rule to mitigate extreme price distortions while preserving authentic variance, preventing data leakage across training and testing partitions.
+2. **Exploratory Data Analysis (EDA)**: Design five focused, publication-grade `ggplot2` visualizations revealing price distributions, room-type pricing hierarchies, borough-level disparities, accommodation capacity proxies, and spatial price clustering.
+3. **Supervised Price Prediction**: Train and evaluate a Multiple Linear Regression baseline alongside a Random Forest regressor on the identical held-out 20% test split, reporting Root Mean Squared Error (RMSE), Mean Absolute Error (MAE), and Coefficient of Determination ($R^2$).
+4. **Local Interpretability via LIME**: Demystify the Random Forest "black box" by computing a local linear surrogate explanation for a specific held-out listing, quantifying individual feature contributions without confusing correlation with causality.
+5. **Neighbourhood Segmentation via K-means**: Standardize neighbourhood aggregate profiles, diagnose the optimal cluster count $k$ using the Total Within-Cluster Sum of Squares (WSS) Elbow Method, and profile the resulting empirical urban segments.
+
+---
+
+# Dataset Description
+
+The analysis utilizes `AB_NYC_2019.csv`, a public snapshot of New York City listings published by Inside Airbnb.
+
+```{r load-dataset}
+# Load dataset with strict path specification
+raw_listings <- read_csv("AB_NYC_2019.csv", show_col_types = FALSE)
+cat("Dataset Dimensions:", nrow(raw_listings), "rows and", ncol(raw_listings), "columns\n")
+```
+
+### Schema & Data Types
+Before executing transformations, we inspect the native column types loaded by `readr`.
+
+```{r inspect-types}
+col_summary <- tibble(
+  Column = names(raw_listings),
+  Data_Type = sapply(raw_listings, function(x) paste(class(x), collapse = "/")),
+  Sample_Value = sapply(raw_listings, function(x) as.character(x[1]))
+)
+kable(col_summary, caption = "Column Names, Native Data Types, and Sample Values")
+```
+
+### Missing Value Analysis
+Missingness is quantified across all 16 variables:
+
+```{r missing-values}
+missing_df <- tibble(
+  Variable = names(raw_listings),
+  Missing_Count = colSums(is.na(raw_listings)),
+  Missing_Pct = round(100 * colSums(is.na(raw_listings)) / nrow(raw_listings), 2)
+) %>% filter(Missing_Count > 0)
+
+kable(missing_df, caption = "Missing Value Counts and Percentages in AB_NYC_2019.csv")
+```
+
+Notice that `reviews_per_month` has exactly **10,052** missing values (20.56%), matching `last_review` exactly. Crucially, every single one of these 10,052 records has `number_of_reviews == 0`. Therefore, these are not missing values resulting from measurement failure; they denote properties that have never received a review, meaning their factual monthly review rate is exactly **0.0**.
+
+### Duplicate Record Inspection
+```{r duplicates}
+cat("Fully duplicated rows :", sum(duplicated(raw_listings)), "\n")
+cat("Duplicated listing IDs:", sum(duplicated(raw_listings$id)), "\n")
+```
+No duplicated records or listing IDs exist in this snapshot.
+
+### Price Inspection (Confirmation of Data Type)
+A common data science error is assuming the `price` column is encoded as a string with currency symbols (`$` or `,`). We explicitly test this:
+
+```{r price-type-check}
+cat("Class of price column:", class(raw_listings$price), "\n")
+summary(raw_listings$price)
+```
+
+The `price` variable is natively loaded as a clean numeric column. No regex currency parsing is necessary.
+
+---
+
+# Data Cleaning and Preprocessing
+
+The preprocessing pipeline implements three defensible, non-arbitrary operations:
+
+1. **Removal of Invalid Rates**: 11 listings exhibit a listed price of `$0`, representing inactive or placeholder accounts. These are purged.
+2. **Outlier Filtering via Interquartile Range (IQR)**: The raw price ranges from `$0` to `$10,000`, with extreme luxury and joke listings severely skewing standard deviation ($s = 240.15$). We compute the standard upper threshold $Q_3 + 1.5 \times \text{IQR}$:
+   $$\text{IQR} = Q_3 - Q_1 = 175 - 69 = 106$$
+   $$\text{Upper Bound} = 175 + 1.5(106) = \$334$$
+3. **Collinear Missing Imputation**: For `reviews_per_month`, `NA` values are replaced with `0` because they represent zero lifetime reviews.
+4. **High-Cardinality Handling**: `neighbourhood` contains 221 distinct categories. Including it directly as a factor predictor in regression would inject over 220 dummy variables, causing extreme variance inflation and overfitting. Instead, `neighbourhood` is preserved for stage 7 (unsupervised aggregation) and excluded from the regression feature matrix.
+
+```{r cleaning-pipeline}
+n_initial <- nrow(raw_listings)
+
+# 1. Purge zero/negative prices
+clean_data <- raw_listings %>% filter(price > 0)
+n_zero <- n_initial - nrow(clean_data)
+
+# 2. IQR Upper Outlier Truncation
+Q1 <- quantile(clean_data$price, 0.25)
+Q3 <- quantile(clean_data$price, 0.75)
+IQR_val <- Q3 - Q1
+upper_bound <- Q3 + 1.5 * IQR_val
+
+n_outliers <- sum(clean_data$price > upper_bound)
+clean_data <- clean_data %>% filter(price <= upper_bound)
+
+# 3. Impute reviews_per_month with 0
+clean_data <- clean_data %>%
+  mutate(reviews_per_month = ifelse(is.na(reviews_per_month), 0, reviews_per_month))
+
+# 4. Feature selection and factor encoding
+listings_model <- clean_data %>%
+  select(
+    price,
+    room_type,
+    neighbourhood_group,
+    neighbourhood,
+    latitude,
+    longitude,
+    minimum_nights,
+    number_of_reviews,
+    reviews_per_month,
+    calculated_host_listings_count,
+    availability_365
+  ) %>%
+  mutate(
+    room_type = as.factor(room_type),
+    neighbourhood_group = as.factor(neighbourhood_group)
+  )
+
+n_retained <- nrow(listings_model)
+```
+
+### Preprocessing Accounting Summary
+```{r cleaning-table}
+clean_summary_table <- tibble(
+  Stage = c("Initial Raw Observations", "Invalid Price ($0) Purged", "IQR Price Outliers (> $334) Removed", "Final Retained Analysis Sample"),
+  Count = c(n_initial, n_zero, n_outliers, n_retained),
+  Percentage = c("100.00%", sprintf("%.2f%%", 100 * n_zero / n_initial), sprintf("%.2f%%", 100 * n_outliers / n_initial), sprintf("%.2f%%", 100 * n_retained / n_initial))
+)
+kable(clean_summary_table, caption = "Data Cleaning Retention and Attrition Audit")
+```
+
+A total of **45,912** observations (93.90% of the dataset) are retained for downstream modeling.
+
+---
+
+# Exploratory Data Analysis (EDA)
+
+We explore the cleaned data using five focused `ggplot2` visualizations.
+
+### 1. Price Distribution
+```{r plot-price-dist}
+ggplot(listings_model, aes(x = price)) +
+  geom_histogram(bins = 50, fill = "#1f77b4", color = "white", alpha = 0.85) +
+  geom_vline(aes(xintercept = median(price)), color = "#d62728", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = median(listings_model$price) + 26, y = 2900,
+           label = paste0("Median = $", round(median(listings_model$price), 1)),
+           color = "#d62728", fontface = "bold") +
+  labs(
+    title = "Figure 1: Distribution of Cleaned Nightly Listing Prices (NYC)",
+    subtitle = "Mildly right-skewed with prominent spikes at psychological thresholds ($50, $100, $150, $200)",
+    x = "Price per Night (USD)",
+    y = "Frequency (Listings)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation**: After removing extreme outliers, prices span from \$10 to \$334 with a median of **\$106** and mean of **\$124.6**. Notable cluster spikes occur at round numbers (\$50, \$100, \$150), indicating psychological price anchoring by hosts.
+
+### 2. Price by Room Type
+```{r plot-room-type}
+ggplot(listings_model, aes(x = room_type, y = price, fill = room_type)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.2, show.legend = FALSE) +
+  scale_fill_manual(values = c("Entire home/apt" = "#2ca02c", "Private room" = "#ff7f0e", "Shared room" = "#9467bd")) +
+  labs(
+    title = "Figure 2: Nightly Price by Room Type",
+    subtitle = "Entire homes/apartments command a substantial premium over private and shared spaces",
+    x = "Room Type",
+    y = "Price per Night (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation**: Room type exhibits the strongest bivariate relationship with price. Entire apartments have a median price of **\$140**, more than double that of private rooms (**\$65**) and shared rooms (**\$40**). The interquartile range for entire homes (\$100–\$200) is substantially wider, reflecting diverse property sizes and finishes.
+
+### 3. Median Price by Borough (Neighbourhood Group)
+```{r plot-borough}
+listings_model %>%
+  group_by(neighbourhood_group) %>%
+  summarise(median_price = median(price), .groups = "drop") %>%
+  ggplot(aes(x = reorder(neighbourhood_group, median_price), y = median_price, fill = neighbourhood_group)) +
+  geom_col(alpha = 0.85, width = 0.55, show.legend = FALSE) +
+  geom_text(aes(label = paste0("$", round(median_price, 1))), hjust = -0.2, fontface = "bold") +
+  coord_flip(ylim = c(0, 155)) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Figure 3: Median Nightly Listing Price by Borough",
+    subtitle = "Manhattan commands the premier geographic rate across New York City",
+    x = "Borough (Neighbourhood Group)",
+    y = "Median Price per Night (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation**: Manhattan commands a distinct median price premium (**\$130**), followed by Brooklyn (**\$90**), Queens (**\$72**), Staten Island (**\$70**), and the Bronx (**\$65**). The geographic gradient highlights Manhattan's dominance in tourist and commercial travel demand.
+
+### 4. Price versus Accommodation Capacity Proxy
+The summary dataset `AB_NYC_2019.csv` does not record explicit guest capacity fields like `accommodates` or `bedrooms`. The room type category serves as the direct proxy for accommodation capacity tier (Entire home accommodates multi-guest parties, Private rooms accommodate 1–2 guests, and Shared rooms accommodate single budget travelers), while `calculated_host_listings_count` measures commercial operational scale.
+
+```{r plot-capacity}
+ggplot(listings_model, aes(x = room_type, y = price, color = room_type)) +
+  geom_jitter(alpha = 0.12, width = 0.25, size = 0.8, show.legend = FALSE) +
+  geom_boxplot(fill = "white", alpha = 0.55, width = 0.35, outlier.shape = NA, color = "black", show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "#d62728", show.legend = FALSE) +
+  labs(
+    title = "Figure 4: Price vs. Accommodation Capacity Hierarchy",
+    subtitle = "Red diamonds indicate category means. Entire homes accommodate larger groups at premium rates",
+    x = "Capacity Hierarchy (Room Type)",
+    y = "Price per Night (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation**: Category means (red diamonds) reflect progressive scaling: Shared Room mean = **\$52.3**, Private Room mean = **\$78.2**, and Entire Home mean = **\$162.7**. Space exclusivity directly scales accommodation capacity and price.
+
+### 5. Geographic Distribution of Listings by Price
+```{r plot-geography}
+ggplot(listings_model, aes(x = longitude, y = latitude, color = price)) +
+  geom_point(alpha = 0.35, size = 0.75) +
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Price ($)") +
+  labs(
+    title = "Figure 5: Spatial Distribution of NYC Airbnb Listings by Price",
+    subtitle = "High-priced listings (bright orange/yellow) cluster densely in Manhattan and coastal Brooklyn",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interpretation**: Geospatial coordinates display pronounced spatial autocorrelation. High-value listings cluster along Manhattan's spine (Midtown, SoHo, West Village) and waterfront Brooklyn (Williamsburg, DUMBO, Brooklyn Heights), while peripheral Bronx, outer Queens, and Staten Island show low-to-moderate pricing.
+
+---
+
+# Linear Regression (Baseline Model)
+
+To predict nightly price, we construct a Multiple Linear Regression model as our parametric baseline.
+
+### Data Splitting & Leakage Prevention
+We partition the dataset into 80% training ($n = 36,732$) and 20% testing ($n = 9,180$) sets using stratified random sampling on `price` via `caret::createDataPartition`. The test set is strictly sequestered until final evaluation.
+
+```{r train-test-split}
+reg_data <- listings_model %>% select(-neighbourhood)
+
+set.seed(123)
+train_idx <- createDataPartition(reg_data$price, p = 0.8, list = FALSE)
+train_set <- reg_data[train_idx, ]
+test_set  <- reg_data[-train_idx, ]
+
+cat("Training partition :", nrow(train_set), "rows\n")
+cat("Testing partition  :", nrow(test_set),  "rows\n")
+```
+
+### Model Estimation
+The linear model specifies `price` as a linear function of all selected predictors:
+$$\text{Price} = \beta_0 + \sum_{j} \beta_j X_j + \epsilon$$
+
+```{r fit-lm}
+lm_model <- lm(price ~ ., data = train_set)
+summary(lm_model)
+```
+
+### Interpretation of Key Coefficients
+1. **Room Type**: With `Entire home/apt` as the reference category:
+   - `Private room`: $\hat{\beta} = -75.26$ ($p < 2 \times 10^{-16}$). Holding location and activity constant, offering a private room rather than an entire apartment discounts the listing by approximately **\$75.26/night**.
+   - `Shared room`: $\hat{\beta} = -99.43$ ($p < 2 \times 10^{-16}$). A shared room incurs a **\$99.43/night** penalty relative to an entire home.
+2. **Borough**: With `Bronx` as the reference category:
+   - `Manhattan`: $\hat{\beta} = +22.22$ ($p < 2 \times 10^{-16}$). Listings in Manhattan command a statistically significant baseline premium over the Bronx.
+   - `Staten Island`: $\hat{\beta} = -79.39$ ($p < 2 \times 10^{-16}$). Distance from central business districts leads to a substantial negative discount.
+3. **Geographic Coordinates**:
+   - `longitude`: $\hat{\beta} = -276.4$ ($p < 2 \times 10^{-16}$). Moving east (higher longitude, toward Long Island) leads to steep price drops, confirming the premium of western NYC (Manhattan and the East River corridor).
+4. **Calendar Availability**:
+   - `availability_365`: $\hat{\beta} = +0.058$ ($p < 2 \times 10^{-16}$). Year-round availability reflects dedicated commercial operations, which list at slightly higher nightly rates.
+
+---
+
+# Random Forest Regression (Comparison Model)
+
+Linear regression assumes strictly additive, linear relationships and cannot model complex spatial boundary effects or high-order interactions without manual engineering. Random Forest Regression (Breiman, 2001) resolves this by bagging an ensemble of de-correlated regression trees:
+- It recursively partitions feature space along nonlinear decision boundaries.
+- At each node split, a random subset of predictors ($m_{try} = 3$) is evaluated, preventing dominant features from dictating every tree.
+- A modest ensemble of $B = 100$ trees is trained for reproducible, laptop-friendly execution.
+
+```{r fit-rf}
+# Load cached model if present to facilitate rapid, reproducible rendering
+if (file.exists("outputs/models/rf_model.rds")) {
+  rf_model <- readRDS("outputs/models/rf_model.rds")
+} else {
+  set.seed(123)
+  rf_model <- randomForest(price ~ ., data = train_set, ntree = 100, mtry = 3, importance = TRUE)
+  saveRDS(rf_model, "outputs/models/rf_model.rds")
+}
+
+print(rf_model)
+```
+
+---
+
+# Model Evaluation and Comparison
+
+Both models are evaluated on the identical 9,180 held-out test observations across three standard metrics:
+- **Root Mean Squared Error (RMSE)**: Penalizes large prediction errors in original price units (\$):
+  $$\text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2}$$
+- **Mean Absolute Error (MAE)**: Average magnitude of absolute error (\$):
+  $$\text{MAE} = \frac{1}{n} \sum_{i=1}^n |y_i - \hat{y}_i|$$
+- **Coefficient of Determination ($R^2$)**: Proportion of test-set price variance explained:
+  $$R^2 = 1 - \frac{\sum (y_i - \hat{y}_i)^2}{\sum (y_i - \bar{y})^2}$$
+
+```{r model-evaluation}
+lm_preds <- predict(lm_model, newdata = test_set)
+rf_preds <- predict(rf_model, newdata = test_set)
+
+eval_results <- tibble(
+  Model = c("Multiple Linear Regression (Baseline)", "Random Forest (Nonlinear Ensemble)"),
+  RMSE  = c(RMSE(lm_preds, test_set$price), RMSE(rf_preds, test_set$price)),
+  MAE   = c(MAE(lm_preds,  test_set$price), MAE(rf_preds,  test_set$price)),
+  R2    = c(R2(lm_preds,   test_set$price), R2(rf_preds,   test_set$price))
+)
+
+kable(eval_results, digits = 3, caption = "Model Performance on Held-Out Test Set (n = 9,180)")
+```
+
+### Actual vs. Predicted Plot
+```{r actual-vs-pred-plot}
+plot_df <- tibble(
+  Actual = test_set$price,
+  Predicted = rf_preds
+)
+
+ggplot(plot_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.25, color = "#1f77b4", size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = "#d62728", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Figure 6: Actual vs. Predicted Nightly Price (Random Forest)",
+    subtitle = paste0("Test set evaluation (n = 9,180). Dashed red line represents ideal 1:1 prediction"),
+    x = "Actual Nightly Price (USD)",
+    y = "Predicted Nightly Price (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Feature Importance in Random Forest
+```{r feature-importance}
+imp_data <- as.data.frame(importance(rf_model)) %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(`%IncMSE`))
+
+ggplot(imp_data, aes(x = reorder(Feature, `%IncMSE`), y = `%IncMSE`)) +
+  geom_col(fill = "#2ca02c", alpha = 0.85, width = 0.6) +
+  coord_flip() +
+  labs(
+    title = "Figure 7: Random Forest Variable Importance (% Increase in MSE)",
+    subtitle = "Permuting room_type or spatial coordinates causes the steepest drop in predictive accuracy",
+    x = "Predictor Feature",
+    y = "% Increase in Mean Squared Error if Permuted"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Evaluation Discussion
+1. **Performance Superiority**: Random Forest demonstrates clear superiority over the linear baseline across all three metrics. Test RMSE decreases from **\$49.23** to **\$43.53** (an \$5.70/night reduction), MAE decreases from **\$36.46** to **\$30.43** (\$6.03 improvement), and $R^2$ climbs from **48.7%** to **59.9%** (an absolute gain of 11.2 percentage points in explained variance).
+2. **Handling Nonlinearities**: The actual vs. predicted plot demonstrates that while the model tracks central market pricing closely, extreme ends exhibit typical regression-to-the-mean shrinkage: low-priced listings are slightly overpredicted, and very high-priced listings (\$280–\$334) are underpredicted.
+3. **Core Drivers**: Feature importance confirms that `room_type`, `longitude`, `latitude`, and `availability_365` are the most influential determinants of Airbnb pricing in New York City.
+
+---
+
+# Model Explainability using LIME
+
+While Random Forest delivers superior accuracy, ensemble decision trees are complex and non-transparent. To provide listing-level accountability, we deploy **LIME** (Local Interpretable Model-agnostic Explanations; Ribeiro et al., 2016).
+
+### Methodological Foundation & S3 Compatibility
+LIME approximates the black-box model locally around a specific observation $x$ by perturbing feature values, obtaining black-box predictions for the perturbed instances, weighting instances by proximity to $x$, and fitting a sparse, interpretable ridge regressor.
+
+In current versions of the R `lime` package, S3 dispatch methods for regression models of class `randomForest` must be registered explicitly:
+
+```{r lime-s3-registration}
+# Register custom S3 methods for randomForest regression in lime
+model_type.randomForest <- function(x, ...) {
+  return("regression")
+}
+
+predict_model.randomForest <- function(x, newdata, type, ...) {
+  res <- predict(x, newdata = newdata)
+  return(data.frame(Response = as.numeric(res)))
+}
+```
+
+### Explaining a Real Test-Set Listing
+We examine the first observation in our held-out test partition:
+
+```{r lime-explanation}
+# Build explainer on training data
+set.seed(123)
+explainer <- lime(
+  x = train_set %>% select(-price),
+  model = rf_model,
+  bin_continuous = TRUE,
+  n_bins = 5
+)
+
+# Extract test listing 1
+target_case <- test_set[1, ] %>% select(-price)
+actual_price <- test_set$price[1]
+predicted_price <- predict(rf_model, newdata = target_case)
+
+# Generate local explanation using lime::explain to prevent dplyr masking
+explanation <- lime::explain(
+  x = target_case,
+  explainer = explainer,
+  n_features = 8
+)
+```
+
+```{r listing-characteristics}
+case_summary <- tibble(
+  Attribute = names(target_case),
+  Value = as.character(unlist(target_case[1, ]))
+)
+kable(case_summary, caption = paste0("Test Listing #1 Profile (Actual Price: $", actual_price, " | Predicted Price: $", round(predicted_price, 2), ")"))
+```
+
+```{r plot-lime}
+plot_features(explanation) +
+  labs(
+    title = "Figure 8: LIME Local Feature Contribution for Test Listing #1",
+    subtitle = sprintf("Actual: $%.0f | RF Predicted: $%.2f | Features pushing prediction UP (blue) vs DOWN (red)",
+                       actual_price, predicted_price)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Detailed Interpretation of LIME Explanation
+- **Listing Context**: The explained listing is a `Private room` in `Brooklyn` with a 4-night minimum, 167 total reviews (1.34 reviews/month), host managing 3 listings, and high calendar availability (314 days/year).
+- **Prediction Accuracy**: The Random Forest predicted **\$91.01**, which is remarkably close to the actual market rate of **\$89.00** (an error of just \$2.01).
+- **Feature Weights**:
+  1. `room_type = Private room` exerts the single largest downward push (**$-\$63.30$**). Offering a private room rather than an entire home suppresses the valuation substantially.
+  2. `longitude <= -74.0` provides a notable positive push (**$+\$21.80$**). The property is located at longitude $-73.988$ (near Gowanus/Park Slope), situating it close to prime downtown Brooklyn and Lower Manhattan transit lines.
+  3. `availability_365 > 265` exerts a positive influence (**$+\$11.90$**), as commercial year-round availability is associated with higher listing rates.
+  4. `neighbourhood_group = Brooklyn` has a mild negative contribution (**$-\$8.93$**) compared to a Manhattan baseline.
+- **Epistemological Caution**: LIME provides a **local linear surrogate approximation** of the model's response surface in the immediate vicinity of this listing. It explains *how the model made this specific prediction*; it **does not establish real-world causality** (e.g., artificially reducing host listing count will not causally change property value).
+
+---
+
+# Neighbourhood Segmentation using K-Means
+
+Having modeled listing-level pricing, we shift to unsupervised learning to uncover structural geographic tiers across New York City.
+
+### Aggregation & Feature Engineering
+We aggregate listings by neighbourhood, retaining the 115 neighbourhoods with at least **30 listings** to ensure statistically robust aggregate estimates:
+- `median_price`: Robust measure of typical accommodation cost.
+- `mean_price`: Captures upper-tail pricing skew within the neighbourhood.
+- `listing_count`: Measures listing density and market supply.
+- `prop_entire_home`: Proportion of entire home listings, serving as the neighbourhood-level accommodation capacity and privacy proxy.
+- `avg_min_nights`: Average minimum stay requirement (short-term vs. extended stay orientation).
+- `avg_reviews`: Average review volume, measuring turnover and booking frequency.
+- `avg_availability`: Average annual calendar availability, indicating commercial vs. casual host orientation.
+
+```{r aggregate-neighbourhoods}
+neigh_summary <- clean_data %>%
+  group_by(neighbourhood) %>%
+  summarise(
+    median_price     = median(price),
+    mean_price       = mean(price),
+    listing_count    = n(),
+    prop_entire_home = mean(room_type == "Entire home/apt"),
+    avg_min_nights   = mean(minimum_nights),
+    avg_reviews      = mean(number_of_reviews),
+    avg_availability = mean(availability_365),
+    .groups = "drop"
+  ) %>%
+  filter(listing_count >= 30) %>%
+  column_to_rownames("neighbourhood")
+
+cat("Number of qualified neighbourhoods (>= 30 listings):", nrow(neigh_summary), "\n")
+```
+
+### Standardizing Features & Selecting $k$ via Elbow Method
+Because variables possess vastly different units and scales (e.g., listing counts in the thousands vs. proportions between 0 and 1), we apply $z$-score standardization ($\mu = 0, \sigma = 1$) prior to Euclidean distance computation.
+
+```{r elbow-method}
+neigh_scaled <- scale(neigh_summary)
+
+set.seed(123)
+wss_values <- sapply(1:10, function(k) {
+  kmeans(neigh_scaled, centers = k, nstart = 25)$tot.withinss
+})
+
+elbow_df <- tibble(k = 1:10, WSS = wss_values)
+
+ggplot(elbow_df, aes(x = k, y = WSS)) +
+  geom_line(color = "#1f77b4", linewidth = 1) +
+  geom_point(color = "#d62728", size = 3) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Figure 9: Elbow Method Diagnostic for Optimal k",
+    subtitle = "Total Within-Cluster Sum of Squares decreases sharply before flattening past k = 4",
+    x = "Number of Clusters (k)",
+    y = "Total Within-Cluster Sum of Squares (WSS)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Diagnostic Analysis**: Total WSS drops sharply from $k=1$ (798.0) to $k=2$ (465.2), $k=3$ (380.0), and $k=4$ (317.4). Beyond $k=4$, marginal variance explained diminishes smoothly ($k=5$ WSS is 262.0), making **$k = 4$** a parsimonious and natural elbow threshold.
+
+### Executing K-Means Clustering ($k = 4$)
+```{r run-kmeans}
+set.seed(123)
+k_chosen <- 4
+km_result <- kmeans(neigh_scaled, centers = k_chosen, nstart = 25)
+
+neigh_summary$cluster <- as.factor(km_result$cluster)
+```
+
+### Empirical Cluster Profiles
+```{r cluster-profiles}
+profiles <- neigh_summary %>%
+  group_by(cluster) %>%
+  summarise(
+    Neighbourhoods    = n(),
+    Median_Price      = mean(median_price),
+    Mean_Price        = mean(mean_price),
+    Avg_Listings      = mean(listing_count),
+    Pct_Entire_Home   = round(100 * mean(prop_entire_home), 1),
+    Avg_Min_Nights    = mean(avg_min_nights),
+    Avg_Reviews       = mean(avg_reviews),
+    Avg_Availability  = mean(avg_availability)
+  )
+
+kable(profiles, digits = 1, caption = "Empirical Cluster Centroid Profiles (k = 4)")
+```
+
+### Visualizing Clusters
+```{r cluster-plot}
+ggplot(neigh_summary, aes(x = median_price, y = listing_count, color = cluster)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  scale_color_brewer(palette = "Set1", name = "Cluster") +
+  labs(
+    title = "Figure 10: Neighbourhood Clusters: Median Price vs. Listing Supply",
+    subtitle = "Reveals 4 distinct urban market segments across New York City",
+    x = "Median Listing Price (USD)",
+    y = "Total Listing Supply Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Interpretation of Empirical Cluster Segments
+Rather than imposing preconceived labels, we characterize the clusters directly from their centroid data:
+
+1. **Cluster 1 (Mega-Volume Cultural & Tourist Hubs; $n = 4$)**:
+   - **Neighbourhoods**: *Bedford-Stuyvesant, Bushwick, Harlem, Williamsburg*.
+   - **Characteristics**: Enormous listing density (averaging **3,096 listings** per neighbourhood), moderate median price (**\$82.8**), lower proportion of entire homes (**38.2%**, predominantly private rooms for young travelers and students), and moderate stays (6.0 nights). These represent NYC's primary volume epicenters.
+2. **Cluster 2 (Moderate-Density Residential Outer Boroughs; $n = 42$)**:
+   - **Neighbourhoods**: *Astoria, Bay Ridge, Bensonhurst, Brighton Beach, Crown Heights, Jackson Heights, Sunset Park...*
+   - **Characteristics**: Moderate listing count (**267.5**), accessible median price (**\$74.8**), lower entire-home share (**36.6%**), and modest availability (126.8 days). These are authentic residential communities serving value-conscious long-stay visitors.
+3. **Cluster 3 (Low-Density, High-Turnover Suburban & Transit Gateways; $n = 28$)**:
+   - **Neighbourhoods**: *Allerton, Arverne, Bayside, Briarwood, Canarsie, Concourse, Jamaica, Flushing...*
+   - **Characteristics**: Low listing density (**91.7**), lowest median price (**\$70.9**), shortest minimum stays (**3.3 nights**), highest lifetime review turnover (**37.3 reviews**), and highest year-round calendar availability (**187.1 days**). Many cluster around JFK/LaGuardia airports or transit hubs, catering to short-stay travelers.
+4. **Cluster 4 (Premium Commercial Manhattan & Waterfront Brooklyn Core; $n = 41$)**:
+   - **Neighbourhoods**: *Chelsea, Chinatown, Financial District, Greenwich Village, Midtown, SoHo, Tribeca, West Village, Brooklyn Heights, DUMBO...*
+   - **Characteristics**: Highest median price (**\$150.7**) and mean price (**\$156.1**), high density (**453.7**), dominated by entire apartments (**66.9% entire home/apt**), and longest minimum stay policies (**8.7 nights**). This represents the luxury, high-capacity urban core.
+
+---
+
+# Results and Discussion
+
+1. **Regression Model Superiority**: The comparison demonstrates that Random Forest significantly outperforms Linear Regression across all three test-set benchmarks, reducing RMSE by **\$5.70** (from \$49.23 to \$43.53) and MAE by **\$6.03** (from \$36.46 to \$30.43), while increasing $R^2$ by **11.2 percentage points** (from 48.7% to 59.9%). The superior performance stems from Random Forest's ability to natively capture complex interactions (e.g., between spatial coordinates and room type) without requiring manual interaction terms.
+2. **Local Feature Attribution via LIME**: Demystifying test listing #1 proved that property type is the dominant pricing lever: offering a private room incurs an immediate local penalty of **$-\$63.30$** compared to an entire residence. Simultaneously, desirable geospatial positioning along prime western transit corridors adds **$+\$21.80$**. LIME demonstrates how machine learning predictions can be rendered transparent and contestable for individual users.
+3. **Market Segmentation Coherence**: K-means clustering over 115 qualified neighbourhoods successfully organized NYC into 4 distinct socio-economic segments:
+   - High-cost, entire-home-dominated commercial cores (Manhattan / waterfront Brooklyn).
+   - Massive-volume hipster cultural hubs (Williamsburg, Bushwick, Bed-Stuy, Harlem).
+   - Residential outer-borough family communities (Queens, South Brooklyn).
+   - High-turnover transit and airport gateways (Queens/Bronx border communities).
+
+---
+
+# Limitations
+
+1. **Single Snapshot Cross-Sectional Data**: The dataset represents a single static snapshot from 2019. It lacks temporal granularity to model seasonal price spikes (e.g., holidays, summer peak tourism) or year-over-year inflation.
+2. **Absence of Interior Amenity Features**: The summary file `AB_NYC_2019.csv` does not record square footage, bathroom counts, bed counts, air conditioning, elevator access, or interior design quality, which realistically explain much of the remaining 40% unexplained variance.
+3. **Information Loss in Aggregation**: Summarizing 221 neighbourhoods using aggregate means inevitably smooths over significant within-neighbourhood micro-heterogeneity (e.g., luxury high-rises coexisting with budget walkups in Harlem).
+4. **Non-Causal Nature of LIME**: LIME's surrogate model is a local mathematical approximation; its weights must not be interpreted as causal policy prescriptions for property hosts.
+
+---
+
+# Conclusion
+
+This case study successfully implemented a complete, reproducible data science workflow in R. By combining data hygiene, disciplined feature selection, linear and tree-based regression, local model interpretability (LIME), and unsupervised clustering (K-means), we established that:
+- Nightly Airbnb prices in New York City are predominantly determined by **room exclusivity** and **micro-geographic location**, with Random Forest explaining approximately **60%** of test-set price variance.
+- Individual predictions can be faithfully decomposed into positive and negative local feature contributions using surrogate linear models.
+- New York City neighbourhoods form four distinct empirical market tiers defined by pricing power, listing supply density, and capacity structure.
+
+---
+
+# References and Reproducibility
+
+### References
+- Inside Airbnb. (2019). *New York City Listings Data*. Retrieved from <http://insideairbnb.com/get-the-data/>
+- Breiman, L. (2001). Random Forests. *Machine Learning*, 45(1), 5–32.
+- Ribeiro, M. T., Singh, S., & Guestrin, C. (2016). "Why Should I Trust You?": Explaining the Predictions of Any Classifier. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 1135–1144.
+- Wickham, H., & Grolemund, G. (2017). *R for Data Science*. O'Reilly Media.
+- R Core Team. (2026). *R: A Language and Environment for Statistical Computing*. R Foundation for Statistical Computing, Vienna, Austria.
+
+### Reproducibility Environment
+This report was compiled in R 4.6.1 with random seed `123`. The complete computational environment details are documented below:
+
+```{r session-info}
+sessionInfo()
+```
