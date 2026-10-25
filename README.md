@@ -1,6 +1,6 @@
 # Airbnb Listing Price Prediction & Neighbourhood Segmentation Using R
 
-An undergraduate Introduction to Data Science (IDS) case study in **R** developed for the B.E. Artificial Intelligence & Data Science curriculum at **CBIT Hyderabad**.
+
 
 This project establishes an end-to-end, reproducible data science workflow on the New York City Airbnb 2019 dataset (`AB_NYC_2019.csv`). It implements data auditing, defensive cleaning, exploratory data analysis with `ggplot2`, supervised regression modeling (Linear Regression vs. Random Forest), model interpretability using **LIME**, and unsupervised market segmentation using **K-means clustering**.
 
